@@ -7,19 +7,15 @@ from typing import NamedTuple, Callable, Optional
 from jax import tree
 from jax.lax import rsqrt, scan
 
-import jax.random as jr
-
 
 class IVONState(NamedTuple):
-    hessian: optax.Params
-    acc_grads: optax.Updates
+    precision: optax.Params
+    momentum: optax.Updates
     step: jax.Array
-    weight_decay: float
-    scaling_parameter: float
 
 
 def sample_parameters(
-    rng_key: jr.key, mean: optax.Params, std: optax.Params
+    rng_key: jax.Array, mean: optax.Params, std: optax.Params
 ) -> optax.Params:
     noise = optax.tree.random_like(rng_key=rng_key, target_tree=mean)
     return noise, tree.map(lambda m, s, eps: m + eps * s, mean, std, noise)
@@ -58,24 +54,23 @@ def scale_by_ivon(
         state: IVONState,
         params: Optional[optax.Params],
         *,
-        nxg: optax.Updates
+        avg_hess_estimate: optax.Updates
     ):
         current_step = optax.safe_int32_increment(state.step)
 
-        g = optax.update_moment(avg_grads, state.acc_grads, decay=beta1, order=1)
-        g = optax.bias_correction(g, beta1, current_step)
+        momentum = optax.update_moment(updates=avg_grads, moments=state.momentum, decay=beta1, order=1)
 
-        hess = _update_hessian(
-            hessian=state.hessian, avg_hess=nxg, beta2=beta2, weight_decay=weight_decay
+        precision = _update_precision(
+            precision=state.precision, avg_hess=avg_hess_estimate, beta2=beta2, weight_decay=weight_decay, scaling_param=scaling_parameter
         )
 
         updates = tree.map(
-            lambda m, h, g: (g + weight_decay * m) / (h + weight_decay),
+            lambda p, s, m: scaling_parameter * (m + weight_decay * p) / s,
             params,
-            hess,
-            g,
+            precision,
+            optax.bias_correction(momentum, beta1, current_step),
         )
-        return updates, state._replace(step=current_step, hessian=hess, acc_grads=g)
+        return updates, state._replace(step=current_step, precision=precision, momentum=momentum)
 
     return optax.GradientTransformationExtraArgs(
         init=lambda p: _ivon_init(p, hessian_init, weight_decay, scaling_parameter),
@@ -87,31 +82,38 @@ def _ivon_init(
     params: optax.Params, hessian_init: float, weight_decay: float, scaling_param: float
 ) -> IVONState:
     hessian = optax.tree.full_like(tree=params, fill_value=hessian_init)
-    grads = optax.tree.zeros_like(params)
+    momentum = optax.tree.zeros_like(params)
     return IVONState(
-        hessian=hessian,
-        acc_grads=grads,
-        step=jnp.zeros([], dtype=jnp.int32),
-        scaling_parameter=scaling_param,
-        weight_decay=weight_decay,
+        precision=tree.map(lambda h: scaling_param * (h + weight_decay), hessian),
+        momentum=momentum,
+        step=jnp.zeros([], dtype=jnp.int32)
     )
 
 
-# TODO: check if it should be called average hessian as per the original paper
-def _update_hessian(
-    hessian: optax.Updates, avg_hess: optax.Updates, beta2: float, weight_decay: float
+def _update_precision(
+    precision: optax.Updates,
+    avg_hess: optax.Updates,
+    beta2: float,
+    weight_decay: float,
+    scaling_param: float,
 ) -> optax.Updates:
-    return tree.map(
-        lambda h, hh: beta2 * h
-        + (1 - beta2) * hh
-        + 0.5 * (1 - beta2) ** 2 * (h - hh) ** 2 / (h + weight_decay),
-        hessian,
-        avg_hess,
-    )
+    update_weight = 1 - beta2
+    correction_weight = 0.5 * update_weight ** 2
+    
+    def update_leaf(current_precision, hessian):
+        estimated_precision = scaling_param * (hessian + weight_decay)
+        correction = (
+            correction_weight
+            * (current_precision - estimated_precision) ** 2
+            / current_precision
+        )
+        return (
+            beta2 * current_precision
+            + update_weight * estimated_precision
+            + correction
+        )
 
-
-def _compute_std(hessian: optax.Params, weight_decay: float, scaling_param: float):
-    return tree.map(lambda h: rsqrt(scaling_param * (h + weight_decay)), hessian)
+    return tree.map(update_leaf, precision, avg_hess)
 
 
 def ivon_value_and_grad(
@@ -127,29 +129,28 @@ def ivon_value_and_grad(
     if ivon_state is None:
         raise ValueError("Could not find IVONState in optimizer state.")
 
-    keys = jr.split(key, mc_samples)
-
-    std = _compute_std(
-        ivon_state.hessian,
-        weight_decay=ivon_state.weight_decay,
-        scaling_param=ivon_state.scaling_parameter,
-    )
+    keys = jax.random.split(key, mc_samples)
+    
+    std = tree.map(rsqrt, ivon_state.precision)
 
     def wrapper(*args, **kwargs):
-        def step(_, key: jax.Array):
+        def step(carry, key: jax.Array):
+            updates, hess = carry
             params = args[argnums]
             noise, psample = sample_parameters(rng_key=key, mean=params, std=std)
             perturbed_args = args[:argnums] + (psample,) + args[argnums + 1 :]
-            value, updates = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)(
+            
+            new_value, new_grads = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)(
                 *perturbed_args, **kwargs
             )
-            nxg = tree.map(lambda g, eps, s: g * eps / s, updates, noise, std)
-            return _, (value, updates, nxg)
-
-        _, (values, grads, nxgs) = scan(step, init=(), xs=keys)
-
-        avg_grad = tree.map(lambda g: jnp.mean(g, axis=0), grads)
-        avg_hess = tree.map(lambda h: jnp.mean(h, axis=0), nxgs)
+            new_hess = tree.map(lambda g, eps, s: g * eps / s, new_grads, noise, std)
+            
+            updates = optax.tree.add_scale(tree_x=updates, tree_y=new_grads, scalar=1/mc_samples)
+            hess = optax.tree.add_scale(tree_x=hess, tree_y=new_hess, scalar=1/mc_samples)
+            
+            return (updates, hess), new_value
+        init_state = (optax.tree.zeros_like(args[argnums]), optax.tree.zeros_like(args[argnums])) 
+        (avg_grad, avg_hess), values = scan(step, init=init_state, xs=keys)
 
         return jnp.mean(values), (avg_grad, avg_hess)
 
