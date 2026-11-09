@@ -1,4 +1,4 @@
-# IVON for Optax
+# (Work in progress) IVON for Optax
 
 A clean, lightweight JAX / [Optax](https://github.com/google-deepmind/optax) implementation of the **IVON** (Improved Variational Online Newton) optimizer.
 
