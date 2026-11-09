@@ -7,6 +7,10 @@ from typing import NamedTuple, Callable, Optional
 from jax import tree
 from jax.lax import rsqrt, scan
 
+# TODO
+# Fix has_aux=True unpacking in ivon_value_and_grad
+# Support Distributed Training (pmean) ? Verify that 
+
 
 class IVONState(NamedTuple):
     precision: optax.Params
@@ -22,13 +26,26 @@ def sample_parameters(
 
 
 def ivon(
-    learning_rate: float,
+    learning_rate: optax.ScalarOrSchedule,
     scaling_parameter: int,
     beta1: float = 0.9,
     beta2: float = 0.99999,
     hessian_init: float = 1.0,
     weight_decay: float = 1e-4,
+    rescale_lr: bool = True,
+    clip_radius: float = float("inf"),
 ) -> optax.GradientTransformation:
+    lr_scale = (
+        (
+            optax.scale_by_learning_rate(learning_rate),
+            optax.scale(hessian_init + weight_decay),
+        )
+        if rescale_lr
+        else (optax.scale_by_learning_rate(learning_rate),)
+    )
+
+    cr_transform = (optax.clip(clip_radius),) if clip_radius < float("inf") else ()
+
     return optax.chain(
         scale_by_ivon(
             scaling_parameter=scaling_parameter,
@@ -37,7 +54,8 @@ def ivon(
             hessian_init=hessian_init,
             weight_decay=weight_decay,
         ),
-        optax.scale_by_learning_rate(learning_rate=learning_rate),
+        *cr_transform,
+        *lr_scale
     )
 
 
@@ -58,10 +76,16 @@ def scale_by_ivon(
     ):
         current_step = optax.safe_int32_increment(state.step)
 
-        momentum = optax.update_moment(updates=avg_grads, moments=state.momentum, decay=beta1, order=1)
+        momentum = optax.update_moment(
+            updates=avg_grads, moments=state.momentum, decay=beta1, order=1
+        )
 
         precision = _update_precision(
-            precision=state.precision, avg_hess=avg_hess_estimate, beta2=beta2, weight_decay=weight_decay, scaling_param=scaling_parameter
+            precision=state.precision,
+            avg_hess=avg_hess_estimate,
+            beta2=beta2,
+            weight_decay=weight_decay,
+            scaling_param=scaling_parameter,
         )
 
         updates = tree.map(
@@ -70,7 +94,9 @@ def scale_by_ivon(
             precision,
             optax.bias_correction(momentum, beta1, current_step),
         )
-        return updates, state._replace(step=current_step, precision=precision, momentum=momentum)
+        return updates, state._replace(
+            step=current_step, precision=precision, momentum=momentum
+        )
 
     return optax.GradientTransformationExtraArgs(
         init=lambda p: _ivon_init(p, hessian_init, weight_decay, scaling_parameter),
@@ -86,7 +112,7 @@ def _ivon_init(
     return IVONState(
         precision=tree.map(lambda h: scaling_param * (h + weight_decay), hessian),
         momentum=momentum,
-        step=jnp.zeros([], dtype=jnp.int32)
+        step=jnp.zeros([], dtype=jnp.int32),
     )
 
 
@@ -98,8 +124,8 @@ def _update_precision(
     scaling_param: float,
 ) -> optax.Updates:
     update_weight = 1 - beta2
-    correction_weight = 0.5 * update_weight ** 2
-    
+    correction_weight = 0.5 * update_weight**2
+
     def update_leaf(current_precision, hessian):
         estimated_precision = scaling_param * (hessian + weight_decay)
         correction = (
@@ -108,9 +134,7 @@ def _update_precision(
             / current_precision
         )
         return (
-            beta2 * current_precision
-            + update_weight * estimated_precision
-            + correction
+            beta2 * current_precision + update_weight * estimated_precision + correction
         )
 
     return tree.map(update_leaf, precision, avg_hess)
@@ -130,7 +154,7 @@ def ivon_value_and_grad(
         raise ValueError("Could not find IVONState in optimizer state.")
 
     keys = jax.random.split(key, mc_samples)
-    
+
     std = tree.map(rsqrt, ivon_state.precision)
 
     def wrapper(*args, **kwargs):
@@ -139,19 +163,35 @@ def ivon_value_and_grad(
             params = args[argnums]
             noise, psample = sample_parameters(rng_key=key, mean=params, std=std)
             perturbed_args = args[:argnums] + (psample,) + args[argnums + 1 :]
-            
-            new_value, new_grads = jax.value_and_grad(fun, argnums=argnums, has_aux=has_aux)(
-                *perturbed_args, **kwargs
-            )
-            new_hess = tree.map(lambda g, eps, s: g * eps / s, new_grads, noise, std)
-            
-            updates = optax.tree.add_scale(tree_x=updates, tree_y=new_grads, scalar=1/mc_samples)
-            hess = optax.tree.add_scale(tree_x=hess, tree_y=new_hess, scalar=1/mc_samples)
-            
-            return (updates, hess), new_value
-        init_state = (optax.tree.zeros_like(args[argnums]), optax.tree.zeros_like(args[argnums])) 
-        (avg_grad, avg_hess), values = scan(step, init=init_state, xs=keys)
 
-        return jnp.mean(values), (avg_grad, avg_hess)
+            out, new_grads = jax.value_and_grad(
+                fun, argnums=argnums, has_aux=has_aux
+            )(*perturbed_args, **kwargs)
+
+            if has_aux:
+                new_value, aux = out
+            else:
+                new_value, aux = out, None  # None is an empty pytree, scan handles it
+
+            new_hess = tree.map(lambda g, eps, s: g * eps / s, new_grads, noise, std)
+
+            updates = optax.tree.add_scale(updates, 1 / mc_samples, new_grads)
+            hess = optax.tree.add_scale(hess, 1 / mc_samples, new_hess)
+
+            return (updates, hess), (new_value, aux)
+
+        init_state = (
+            optax.tree.zeros_like(args[argnums]),
+            optax.tree.zeros_like(args[argnums]),
+        )
+        (avg_grad, avg_hess), (values, auxs) = scan(step, init=init_state, xs=keys)
+
+        value = jnp.mean(values)
+        grads_and_hess = (avg_grad, avg_hess)
+
+        if has_aux:
+            aux = tree.map(lambda x: jnp.mean(x, axis=0), auxs)
+            return (value, aux), grads_and_hess
+        return value, grads_and_hess
 
     return wrapper
